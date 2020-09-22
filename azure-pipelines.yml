@@ -1,0 +1,140 @@
+# Component yml template
+trigger:
+ branches:
+    include:
+      -  master
+
+pool:
+  name: Hosted Windows 2019 with VS2019
+  demands:
+  - msbuild
+  - visualstudio
+  - java
+  
+name: '1.0.0.$(BuildCounter)'
+  
+variables:
+  BuildConfiguration: 'Release'
+  BuildCounter: $[counter(variables['Build.BuildNumber'], 1)]
+  BuildPlatform: 'Any CPU'
+  nugetPackVersion: ''
+  revision: '' 
+  FolderName: 'src' #UPDATE#
+  ProjName: 'IAS.Audit' #UPDATE#
+  SonarName: 'IAS.Audit' #UPDATE
+
+steps:
+- powershell: |
+   $info = (Get-Content 'properties/AssemblyInfo.cs')
+   
+   Write-Host $info
+   
+   $matches = ([regex]'AssemblyFileVersion\("([^"]+)"\)').Matches($info)
+   $newBuildNumber = $matches[0].Groups[1].Value
+   
+   [String]$myrev = $Env:BUILD_BUILDNUMBER
+   $rev = $myrev.Substring($myrev.LastIndexOf('.') + 1)
+   $commitid = $Env:BUILD_SOURCEVERSION.Substring(0,8)
+   
+   Write-Host "##vso[task.setvariable variable=revision;]$rev"
+   
+   Write-Host "Build Number detected: " $newBuildNumber
+   $final = "$newBuildNumber.$rev+$commitid"
+   Write-Host $final
+   
+   Write-Host "##vso[task.setvariable variable=nugetPackVersion;]$final"
+   Write-Host "##vso[build.updatebuildnumber]$final"
+   
+  workingDirectory: '$(FolderName)'
+  displayName: 'Get AssemblyInfo script'
+
+
+- task: update-assembly-info@2
+  displayName: 'Update Assembly: **\*AssemblyInfo.*'
+  inputs:
+    assemblyInfoFiles: '**\*AssemblyInfo.*'
+    informationalVersion: '$(nugetPackVersion)'
+    fileVersionRevision: '$(revision)'
+    assemblyVersionRevision: '$(revision)'
+
+- task: NuGetToolInstaller@0
+  displayName: 'Use NuGet 5.4.0'
+  inputs:
+    versionSpec: 5.4.0
+
+- task: NuGetCommand@2
+  displayName: 'NuGet restore'
+  inputs:
+    restoreSolution: '**\*.sln'
+    vstsFeed: '/ce2b3d81-9dc3-4aac-89a0-62e8daa64826'
+
+- task: SonarCloudPrepare@1
+  displayName: 'Prepare analysis on SonarCloud'
+  inputs:
+    SonarCloud: SonarCloud
+    organization: ias
+    projectKey: $(SonarName)
+    projectName: $(SonarName)
+    extraProperties: |
+     # Additional properties that will be passed to the scanner, 
+     # Put one key=value per line, example:
+     # sonar.exclusions=**/*.bin
+     sonar.cs.vscoveragexml.reportsPaths=$(Agent.TempDirectory)/**/*.coveragexml
+     sonar.cs.vstest.reportsPaths=$(Agent.TempDirectory)/*/*.trx
+
+- task: VSBuild@1
+  displayName: 'Build solution **\*.sln'
+  inputs:
+    solution: '**\*.sln'
+    platform: '$(BuildPlatform)'
+    configuration: '$(BuildConfiguration)'
+
+- task: VSTest@2
+  displayName: 'VsTest - testAssemblies'
+  inputs:
+    testAssemblyVer2: |
+     test\IAS.Audit.Tests\bin\$(BuildConfiguration)\**\IAS.Audit.Tests.dll
+     !**\obj\**
+    codeCoverageEnabled: true
+    platform: '$(BuildPlatform)'
+    configuration: '$(BuildConfiguration)'
+    diagnosticsEnabled: True
+  enabled: true #VSTest
+
+- task: SonarCloudAnalyze@1
+  displayName: 'Run Code Analysis'
+
+- task: SonarCloudPublish@1
+  displayName: 'Publish Quality Gate Result'
+
+- task: DotNetCoreCLI@2
+  displayName: 'dotnet pack'
+  inputs:
+    command: 'pack'
+    packagesToPack: '**/$(ProjName).csproj'
+    versioningScheme: byEnvVar
+    versionEnvVar: nugetPackVersion
+  condition: and(Succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+ 
+- task: PublishSymbols@2
+  displayName: 'Publish symbols path'
+  inputs:
+    SearchPattern: '**\bin\**\*.pdb'
+    SymbolServerType: TeamServices
+  continueOnError: true
+  condition: and(Succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+- task: CopyFiles@2
+  displayName: 'Copy Files to: $(build.artifactstagingdirectory)'
+  inputs:
+    SourceFolder: '$(system.defaultworkingdirectory)'
+    Contents: '**\bin\$(BuildConfiguration)\**'
+    TargetFolder: '$(build.artifactstagingdirectory)'
+  condition: and(Succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Artifact: drop'
+  inputs:
+    PathtoPublish: '$(build.artifactstagingdirectory)'
+  condition: and(Succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
